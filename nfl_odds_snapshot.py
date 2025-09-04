@@ -1,6 +1,7 @@
 # nfl_odds_snapshot.py
 # Fetches NFL odds from The Odds API v4, averages across bookmakers, and appends snapshots to CSV.
-# Usage: python nfl_odds_snapshot.py --api-key YOUR_KEY --snapshot-label openers
+# Usage: python nfl_odds_snapshot.py --snapshot-label openers
+# Reads THE_ODDS_API_KEY from ~/.bashrc if --api-key isn't provided.
 
 from __future__ import annotations
 import argparse, csv, datetime as dt, json, os, sys
@@ -13,6 +14,30 @@ SPORT_KEY = "americanfootball_nfl"
 DEFAULT_BOOKMAKERS = ["draftkings","fanduel","betmgm","bovada","betonlineag","betrivers","mybookieag","lowvig"]
 DEFAULT_OUTPUT = "nfl_odds_snapshots.csv"
 DEFAULT_RAW_DIR = "raw_snapshots"
+
+def _api_key_from_bashrc(var_name: str = "THE_ODDS_API_KEY") -> Optional[str]:
+    """Retrieve API key from ~/.bashrc.
+
+    Looks for lines like `export THE_ODDS_API_KEY=VALUE` or `THE_ODDS_API_KEY=VALUE`.
+    Returns the value if found, otherwise None.
+    """
+    bashrc = os.path.expanduser("~/.bashrc")
+    if not os.path.isfile(bashrc):
+        return None
+    with open(bashrc, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            if line.startswith(f"{var_name}="):
+                value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return value
+    return None
+
+def _default_api_key() -> Optional[str]:
+    return os.getenv("THE_ODDS_API_KEY") or _api_key_from_bashrc()
 
 def american_to_prob(odds: int) -> float:
     if odds is None: return float("nan")
@@ -83,7 +108,7 @@ def save_raw_snapshot(raw_dir:str,label:str,timestamp_iso:str,payload:List[Dict]
 
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument("--api-key", default=os.getenv("THE_ODDS_API_KEY"))
+    parser.add_argument("--api-key", default=_default_api_key())
     parser.add_argument("--sport", default=SPORT_KEY)
     parser.add_argument("--regions", default="us,us2")
     parser.add_argument("--bookmakers", default=",".join(DEFAULT_BOOKMAKERS))
