@@ -1,19 +1,25 @@
 # nfl_odds_snapshot.py
-# Fetches NFL odds from The Odds API v4, averages across bookmakers, and appends snapshots to CSV.
+# Fetches NFL odds from The Odds API v4, averages across bookmakers, and appends snapshots to Google Sheets.
 # Usage: python nfl_odds_snapshot.py --snapshot-label openers
 # Reads THE_ODDS_API_KEY from ~/.bashrc if --api-key isn't provided.
 
 from __future__ import annotations
-import argparse, csv, datetime as dt, json, os, sys
+import argparse, datetime as dt, json, os, sys
 from typing import Dict, List, Optional, Tuple
 import requests
+
+# Google Sheets imports
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 API_HOST = "https://api.the-odds-api.com"
 SPORT_KEY = "americanfootball_nfl"
 
 DEFAULT_BOOKMAKERS = ["draftkings","fanduel","betmgm","bovada","betonlineag","betrivers","mybookieag","lowvig"]
-DEFAULT_OUTPUT = "nfl_odds_snapshots.csv"
+DEFAULT_SHEET_ID = "10U1k9QeVYcm2Mwfvj2ZbtU0_KkEq7FlqeUOZWCf5MVw"
+DEFAULT_SHEET_NAME = "Game Odds"
 DEFAULT_RAW_DIR = "raw_snapshots"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 def _api_key_from_bashrc(var_name: str = "THE_ODDS_API_KEY") -> Optional[str]:
     """Retrieve API key from ~/.bashrc.
@@ -92,13 +98,6 @@ def simple_average(prices: List[int]) -> Optional[float]:
 
 def ensure_dir(path:str): os.makedirs(path, exist_ok=True)
 
-def append_csv_row(path:str, row:Dict[str,object], fieldnames:List[str]):
-    file_exists=os.path.isfile(path)
-    with open(path,"a",newline="",encoding="utf-8") as f:
-        writer=csv.DictWriter(f,fieldnames=fieldnames)
-        if not file_exists: writer.writeheader()
-        writer.writerow(row)
-
 def save_raw_snapshot(raw_dir:str,label:str,timestamp_iso:str,payload:List[Dict]):
     ensure_dir(raw_dir)
     fname=f"odds_raw_{label}_{timestamp_iso.replace(':','').replace('-','').replace('Z','')}.json"
@@ -106,18 +105,46 @@ def save_raw_snapshot(raw_dir:str,label:str,timestamp_iso:str,payload:List[Dict]
     with open(fpath,"w",encoding="utf-8") as f: json.dump(payload,f,indent=2)
     return fpath
 
+def get_sheets_service(creds_path: Optional[str] = None):
+    """Return a Sheets API service. If creds_path is None, fall back to the
+    GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    """
+    if not creds_path:
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if not creds_path:
+        raise FileNotFoundError("No Google credentials path provided")
+    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+    return build('sheets','v4',credentials=creds, cache_discovery=False)
+
+def ensure_sheet_header(service, spreadsheet_id: str, sheet_name: str, headers: List[str]):
+    range_ = f"{sheet_name}!1:1"
+    result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_).execute()
+    values = result.get('values', [])
+    if not values or values[0] != headers:
+        body = {'values': [headers]}
+        service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=range_, valueInputOption='RAW', body=body).execute()
+
+def append_sheet_row(service, spreadsheet_id: str, sheet_name: str, row_values: List[object]):
+    range_ = f"{sheet_name}!A:Z"
+    body = {'values': [row_values]}
+    service.spreadsheets().values().append(spreadsheetId=spreadsheet_id, range=range_, valueInputOption='USER_ENTERED', insertDataOption='INSERT_ROWS', body=body).execute()
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--api-key", default=_default_api_key())
     parser.add_argument("--sport", default=SPORT_KEY)
-    parser.add_argument("--regions", default="us,us2")
+    parser.add_argument("--regions", default="us")
+    # parser.add_argument("--regions", default="us,us2")
     parser.add_argument("--bookmakers", default=",".join(DEFAULT_BOOKMAKERS))
     parser.add_argument("--markets", default="h2h")
+    # parser.add_argument("--markets", default="h2h,spreads,totals")
     parser.add_argument("--odds-format", default="american")
     parser.add_argument("--commence-from", default=None)
     parser.add_argument("--commence-to", default=None)
     parser.add_argument("--snapshot-label", default="snapshot")
-    parser.add_argument("--out", default=DEFAULT_OUTPUT)
+    parser.add_argument("--sheet-id", default=os.getenv("SHEET_ID", DEFAULT_SHEET_ID))
+    parser.add_argument("--sheet-name", default=DEFAULT_SHEET_NAME)
+    parser.add_argument("--gcp-creds", default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
     parser.add_argument("--raw-dir", default=DEFAULT_RAW_DIR)
     args=parser.parse_args()
 
@@ -130,6 +157,14 @@ def main():
     print(f"Saved raw JSON to {raw_path}")
 
     fieldnames=["timestamp","snapshot_label","event_id","commence_time","home_team","away_team","bookmaker_count","avg_home_american","avg_away_american","avg_home_implied_prob","avg_away_implied_prob","consensus_home_american_from_prob","consensus_away_american_from_prob"]
+    # initialize Sheets service and ensure header (use env var GOOGLE_APPLICATION_CREDENTIALS if not passed)
+    try:
+        service = get_sheets_service(args.gcp_creds)
+    except Exception:
+        print("No Google credentials provided; set GOOGLE_APPLICATION_CREDENTIALS or pass --gcp-creds pointing to a service account JSON file")
+        sys.exit(2)
+    ensure_sheet_header(service, args.sheet_id, args.sheet_name, fieldnames)
+
     rows_written=0
     for event in data:
         away_prices,home_prices,per_book=extract_h2h_prices(event)
@@ -148,7 +183,10 @@ def main():
             "avg_away_implied_prob":round(avg_away_prob,5) if avg_away_prob is not None else None,
             "consensus_home_american_from_prob":prob_to_american(avg_home_prob) if avg_home_prob else None,
             "consensus_away_american_from_prob":prob_to_american(avg_away_prob) if avg_away_prob else None}
-        append_csv_row(args.out,row,fieldnames); rows_written+=1
-    print(f"Wrote {rows_written} rows to {args.out}")
+        # prepare ordered values, convert None to empty string
+        values = [row.get(k) if row.get(k) is not None else "" for k in fieldnames]
+        append_sheet_row(service, args.sheet_id, args.sheet_name, values)
+        rows_written+=1
+    print(f"Wrote {rows_written} rows to Google Sheet {args.sheet_id}")
 
 if __name__=="__main__": main()
