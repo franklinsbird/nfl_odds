@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 import argparse, datetime as dt, json, os, sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Sequence
 import requests
+from googleapiclient.errors import HttpError
 
 # Google Sheets imports
 from google.oauth2 import service_account
@@ -17,9 +18,13 @@ SPORT_KEY = "americanfootball_nfl"
 
 DEFAULT_BOOKMAKERS = ["draftkings","fanduel","betmgm","bovada","betonlineag","betrivers","mybookieag","lowvig"]
 DEFAULT_SHEET_ID = "10U1k9QeVYcm2Mwfvj2ZbtU0_KkEq7FlqeUOZWCf5MVw"
-DEFAULT_SHEET_NAME = "Game Odds"
+DEFAULT_SHEET_NAME = "Odds"
 DEFAULT_RAW_DIR = "raw_snapshots"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/spreadsheets"]
+# creds = Credentials.from_service_account_file("/Users/fbird/Desktop/Testing/CSP/cspscraping-4e20669fcaf7.json", scopes=scope)
+# client = gspread.authorize(creds)
+# sheet = client.open_by_key(sheet_id).worksheet(tab_name)
 
 def _api_key_from_bashrc(var_name: str = "THE_ODDS_API_KEY") -> Optional[str]:
     """Retrieve API key from ~/.bashrc.
@@ -68,8 +73,35 @@ def fetch_odds(api_key: str, sport_key: str=SPORT_KEY, regions: str="us,us2",
     if commence_from: params["commenceTimeFrom"] = commence_from
     if commence_to: params["commenceTimeTo"] = commence_to
     url = f"{API_HOST}/v4/sports/{sport_key}/odds"
+    # Log the outgoing API call to avoid silent usage
+    print(f"Calling Odds API: {url}")
+    print(f"Parameters: { {k:v for k,v in params.items() if k!='apiKey'} } (apiKey omitted)")
     resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()
+
+    # Try to parse remaining credits from response headers (best-effort)
+    def _parse_credits_from_headers(hdrs: dict) -> Optional[str]:
+        if not hdrs:
+            return None
+        # normalize to lowercase keys
+        l = {k.lower(): v for k, v in hdrs.items()}
+        candidates = [
+            'x-requests-remaining', 'x-requests-available', 'x-ratelimit-remaining',
+            'x-credits-remaining', 'remaining-credits', 'x-request-limit-remaining',
+            'x-ratelimit-remaining-requests'
+        ]
+        for key in candidates:
+            if key in l:
+                return l[key]
+        # Some providers include a JSON field in body; we won't parse that here.
+        return None
+
+    credits = _parse_credits_from_headers(dict(resp.headers))
+    if credits is not None:
+        print(f"Odds API call completed. Credits remaining: {credits}")
+    else:
+        print("Odds API call completed. Credits remaining: (unknown)")
+
     return resp, resp.json()
 
 def extract_h2h_prices(event: Dict):
@@ -113,21 +145,94 @@ def get_sheets_service(creds_path: Optional[str] = None):
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if not creds_path:
         raise FileNotFoundError("No Google credentials path provided")
-    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scope)
     return build('sheets','v4',credentials=creds, cache_discovery=False)
 
+def _a1_sheet_range(sheet_name: str, cell_range: str) -> str:
+    """Return an A1-style range with the sheet name properly quoted when needed.
+
+    If the sheet name contains spaces or special chars, wrap in single quotes and
+    escape any single quotes by doubling them (per A1 notation rules).
+    """
+    if sheet_name is None:
+        sheet_name = ""
+    # escape single quotes by doubling
+    safe = sheet_name.replace("'", "''")
+    # wrap in quotes if it contains whitespace or any of []:*?/\\
+    if any(c.isspace() for c in sheet_name) or any(ch in sheet_name for ch in '[]:*?/\\'):
+        safe = f"'{safe}'"
+    return f"{safe}!{cell_range}"
+
 def ensure_sheet_header(service, spreadsheet_id: str, sheet_name: str, headers: List[str]):
-    range_ = f"{sheet_name}!1:1"
-    result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_).execute()
+    # Use an explicit A1 range for the header row to avoid parsing issues
+    range_ = _a1_sheet_range(sheet_name, "A1:Z1")
+    try:
+        result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_).execute()
+    except HttpError as e:
+        # If the sheet name doesn't exist or the range can't be parsed, try to
+        # ensure the sheet exists and create it if necessary, then retry.
+        msg = str(e)
+        if 'Unable to parse range' in msg or (hasattr(e, 'resp') and getattr(e.resp, 'status', None) == 400):
+            # Fetch existing sheet titles
+            meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id, fields='sheets.properties').execute()
+            sheets = [s['properties']['title'] for s in meta.get('sheets', []) if 'properties' in s]
+            if sheet_name not in sheets:
+                print(f"Sheet '{sheet_name}' not found in spreadsheet; creating it.")
+                service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={
+                    'requests': [{'addSheet': {'properties': {'title': sheet_name}}}]
+                }).execute()
+            else:
+                # sheet exists but range parsing failed for another reason; re-raise
+                raise
+            # retry getting the range after creating sheet
+            result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_).execute()
+        else:
+            raise
+
     values = result.get('values', [])
     if not values or values[0] != headers:
         body = {'values': [headers]}
         service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=range_, valueInputOption='RAW', body=body).execute()
 
-def append_sheet_row(service, spreadsheet_id: str, sheet_name: str, row_values: List[object]):
-    range_ = f"{sheet_name}!A:Z"
+def append_sheet_row(service, spreadsheet_id: str, sheet_name: str, row_values: Sequence[object]):
+    range_ = _a1_sheet_range(sheet_name, "A:Z")
     body = {'values': [row_values]}
     service.spreadsheets().values().append(spreadsheetId=spreadsheet_id, range=range_, valueInputOption='USER_ENTERED', insertDataOption='INSERT_ROWS', body=body).execute()
+
+def append_sheet_rows(service, spreadsheet_id: str, sheet_name: str, rows: List[List[object]], batch_size: int = 50, max_retries: int = 5):
+    """Append rows in batches to reduce number of write requests and retry on rate limits.
+
+    batch_size controls how many rows are sent in a single append request. Adjust down
+    if you still hit per-request limits. Uses exponential backoff on HttpError 429.
+    """
+    import time, random
+    if not rows:
+        return
+    # ensure rows are lists
+    batches = [rows[i:i+batch_size] for i in range(0, len(rows), batch_size)]
+    for batch in batches:
+        body = {'values': batch}
+        attempt = 0
+        while True:
+            try:
+                range_ = _a1_sheet_range(sheet_name, "A:Z")
+                service.spreadsheets().values().append(spreadsheetId=spreadsheet_id, range=range_, valueInputOption='USER_ENTERED', insertDataOption='INSERT_ROWS', body=body).execute()
+                break
+            except HttpError as e:
+                status = None
+                try:
+                    status = int(getattr(e.resp, 'status', 0))
+                except Exception:
+                    status = None
+                # retry on 429 or 503
+                if status in (429, 503) and attempt < max_retries:
+                    sleep_time = (2 ** attempt) + random.random()
+                    print(f"Rate-limited (status={status}), retrying in {sleep_time:.1f}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(sleep_time)
+                    attempt += 1
+                    continue
+                # otherwise re-raise
+                raise
 
 def main():
     parser=argparse.ArgumentParser()
@@ -145,6 +250,7 @@ def main():
     parser.add_argument("--sheet-id", default=os.getenv("SHEET_ID", DEFAULT_SHEET_ID))
     parser.add_argument("--sheet-name", default=DEFAULT_SHEET_NAME)
     parser.add_argument("--gcp-creds", default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+    parser.add_argument("--raw-file", default=None, help="Path to a previously saved raw snapshot JSON to use instead of calling the Odds API")
     parser.add_argument("--raw-dir", default=DEFAULT_RAW_DIR)
     args=parser.parse_args()
 
@@ -152,9 +258,20 @@ def main():
         print("No API key provided"); sys.exit(2)
     bookmakers=[bk.strip() for bk in args.bookmakers.split(",") if bk.strip()]
     ts=now_iso()
-    resp,data=fetch_odds(args.api_key,args.sport,args.regions,bookmakers,args.markets,args.odds_format,args.commence_from,args.commence_to)
-    raw_path=save_raw_snapshot(args.raw_dir,args.snapshot_label,ts,data)
-    print(f"Saved raw JSON to {raw_path}")
+
+    # If a cached raw file is provided, use it and do not call the Odds API.
+    if args.raw_file:
+        if not os.path.isfile(args.raw_file):
+            print(f"Raw file {args.raw_file} not found"); sys.exit(2)
+        print(f"Using cached raw snapshot: {args.raw_file}")
+        with open(args.raw_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        resp = None
+        raw_path = args.raw_file
+    else:
+        resp,data=fetch_odds(args.api_key,args.sport,args.regions,bookmakers,args.markets,args.odds_format,args.commence_from,args.commence_to)
+        raw_path=save_raw_snapshot(args.raw_dir,args.snapshot_label,ts,data)
+        print(f"Saved raw JSON to {raw_path}")
 
     fieldnames=["timestamp","snapshot_label","event_id","commence_time","home_team","away_team","bookmaker_count","avg_home_american","avg_away_american","avg_home_implied_prob","avg_away_implied_prob","consensus_home_american_from_prob","consensus_away_american_from_prob"]
     # initialize Sheets service and ensure header (use env var GOOGLE_APPLICATION_CREDENTIALS if not passed)
@@ -165,7 +282,7 @@ def main():
         sys.exit(2)
     ensure_sheet_header(service, args.sheet_id, args.sheet_name, fieldnames)
 
-    rows_written=0
+    rows_to_append: List[List[object]] = []
     for event in data:
         away_prices,home_prices,per_book=extract_h2h_prices(event)
         if not away_prices or not home_prices: continue
@@ -185,8 +302,11 @@ def main():
             "consensus_away_american_from_prob":prob_to_american(avg_away_prob) if avg_away_prob else None}
         # prepare ordered values, convert None to empty string
         values = [row.get(k) if row.get(k) is not None else "" for k in fieldnames]
-        append_sheet_row(service, args.sheet_id, args.sheet_name, values)
-        rows_written+=1
-    print(f"Wrote {rows_written} rows to Google Sheet {args.sheet_id}")
+        rows_to_append.append(values)
+
+    # append all rows in batches to avoid per-row write quota limits
+    if rows_to_append:
+        append_sheet_rows(service, args.sheet_id, args.sheet_name, rows_to_append, batch_size=50)
+    print(f"Wrote {len(rows_to_append)} rows to Google Sheet {args.sheet_id}")
 
 if __name__=="__main__": main()
