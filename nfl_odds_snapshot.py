@@ -8,6 +8,7 @@ import argparse, datetime as dt, json, os, sys
 from typing import Dict, List, Optional, Tuple, Sequence
 import requests
 from googleapiclient.errors import HttpError
+from zoneinfo import ZoneInfo
 
 # Google Sheets imports
 from google.oauth2 import service_account
@@ -108,7 +109,7 @@ def extract_h2h_prices(event: Dict):
     away_prices, home_prices, per_book = [], [], {}
     for bk in event.get("bookmakers",[]):
         bk_key = bk.get("key")
-        h2h = next((m for m in bk.get("markets",[]) if m.get("key")=="h2h"), None)
+        h2h = next((m for m in bk.get("markets",[]) if m.get("key")=="h2h" or m.get("key")=="moneyline"), None)
         if not h2h: continue
         away_odds, home_odds = None, None
         for out in h2h.get("outcomes",[]):
@@ -118,6 +119,50 @@ def extract_h2h_prices(event: Dict):
             per_book[bk_key]=(away_odds,home_odds)
             away_prices.append(away_odds); home_prices.append(home_odds)
     return away_prices, home_prices, per_book
+
+
+def extract_spread_values(event: Dict):
+    """Extract per-book spreads for home and away teams. Returns (home_spreads, away_spreads).
+
+    Spread values follow the convention where negative point means that team is the favorite.
+    We normalize so the returned value is the numeric point applied to that team (negative if that
+    team is favored). Some feeds use 'point' or 'handicap' or 'line' as the numeric key.
+    """
+    home_spreads, away_spreads = [], []
+    def _get_point(o):
+        for fk in ("point","handicap","line", "price", "value"):
+            if fk in o and o.get(fk) is not None:
+                try:
+                    return float(o.get(fk))
+                except Exception:
+                    try:
+                        return float(str(o.get(fk)).replace("+",""))
+                    except Exception:
+                        return None
+        return None
+
+    for bk in event.get("bookmakers", []):
+        bk_key = bk.get("key")
+        sp = next((m for m in bk.get("markets",[]) if m.get("key") in ("spreads","spread","point_spread")), None)
+        if not sp:
+            # sometimes spreads are provided under a different key or nested; skip gracefully
+            continue
+        outcomes = sp.get("outcomes") or sp.get("outcome") or []
+        home_point = None
+        away_point = None
+        for out in outcomes:
+            name = out.get("name")
+            pt = _get_point(out)
+            if name == event.get("home_team"):
+                home_point = pt
+            elif name == event.get("away_team"):
+                away_point = pt
+        # If market reports points as positive for favorite vs negative, we keep values as-is
+        if home_point is not None:
+            home_spreads.append(home_point)
+        if away_point is not None:
+            away_spreads.append(away_point)
+    return home_spreads, away_spreads
 
 def average_implied_prob(prices: List[int]) -> Optional[float]:
     probs=[american_to_prob(p) for p in prices if p is not None]
@@ -234,6 +279,28 @@ def append_sheet_rows(service, spreadsheet_id: str, sheet_name: str, rows: List[
                 # otherwise re-raise
                 raise
 
+def format_commence_pacific(iso_str: Optional[str]) -> Optional[str]:
+    """Convert an ISO8601 UTC timestamp to America/Los_Angeles and format as "MM/DD/YYYY hh:mm AM/PM TZ".
+
+    If input is falsy, returns None. If parsing fails, returns the original string.
+    """
+    if not iso_str:
+        return None
+    try:
+        s = iso_str
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dtobj = dt.datetime.fromisoformat(s)
+        if dtobj.tzinfo is None:
+            dtobj = dtobj.replace(tzinfo=dt.timezone.utc)
+        pac = dtobj.astimezone(ZoneInfo("America/Los_Angeles"))
+        # Example: 09/07/2025 01:00 PM PDT
+        fmt = pac.strftime("%m/%d/%Y %I:%M %p")
+        tz = pac.tzname() or "PT"
+        return f"{fmt} {tz}"
+    except Exception:
+        return iso_str
+
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--api-key", default=_default_api_key())
@@ -241,9 +308,9 @@ def main():
     parser.add_argument("--regions", default="us")
     # parser.add_argument("--regions", default="us,us2")
     parser.add_argument("--bookmakers", default=",".join(DEFAULT_BOOKMAKERS))
-    parser.add_argument("--markets", default="h2h")
-    # parser.add_argument("--markets", default="h2h,spreads,totals")
+    parser.add_argument("--markets", default="h2h,spreads")
     parser.add_argument("--odds-format", default="american")
+    # parser.add_argument("--markets", default="h2h,spreads,totals")
     parser.add_argument("--commence-from", default=None)
     parser.add_argument("--commence-to", default=None)
     parser.add_argument("--snapshot-label", default="snapshot")
@@ -273,40 +340,68 @@ def main():
         raw_path=save_raw_snapshot(args.raw_dir,args.snapshot_label,ts,data)
         print(f"Saved raw JSON to {raw_path}")
 
-    fieldnames=["timestamp","snapshot_label","event_id","commence_time","home_team","away_team","bookmaker_count","avg_home_american","avg_away_american","avg_home_implied_prob","avg_away_implied_prob","consensus_home_american_from_prob","consensus_away_american_from_prob"]
+    # Updated column names: record moneyline averages + spread averages
+    fieldnames = [
+        "timestamp", "snapshot_label", "event_id", "commence_time", "home_team", "away_team", "bookmaker_count",
+        "avg_home_moneyline", "avg_away_moneyline", "avg_home_implied_prob", "avg_away_implied_prob",
+        "consensus_home_american_from_prob", "consensus_away_american_from_prob",
+        "avg_home_spread", "avg_away_spread"
+    ]
+
     # initialize Sheets service and ensure header (use env var GOOGLE_APPLICATION_CREDENTIALS if not passed)
     try:
         service = get_sheets_service(args.gcp_creds)
     except Exception:
         print("No Google credentials provided; set GOOGLE_APPLICATION_CREDENTIALS or pass --gcp-creds pointing to a service account JSON file")
         sys.exit(2)
+
     ensure_sheet_header(service, args.sheet_id, args.sheet_name, fieldnames)
 
-    rows_to_append: List[List[object]] = []
+    rows_to_append: List[Sequence[object]] = []
     for event in data:
-        away_prices,home_prices,per_book=extract_h2h_prices(event)
-        if not away_prices or not home_prices: continue
-        avg_home_odds=simple_average(home_prices)
-        avg_away_odds=simple_average(away_prices)
-        avg_home_prob=average_implied_prob(home_prices)
-        avg_away_prob=average_implied_prob(away_prices)
-        row={
-            "timestamp":ts,"snapshot_label":args.snapshot_label,"event_id":event.get("id"),
-            "commence_time":event.get("commence_time"),"home_team":event.get("home_team"),
-            "away_team":event.get("away_team"),"bookmaker_count":len(per_book),
-            "avg_home_american":round(avg_home_odds,2) if avg_home_odds is not None else None,
-            "avg_away_american":round(avg_away_odds,2) if avg_away_odds is not None else None,
-            "avg_home_implied_prob":round(avg_home_prob,5) if avg_home_prob is not None else None,
-            "avg_away_implied_prob":round(avg_away_prob,5) if avg_away_prob is not None else None,
-            "consensus_home_american_from_prob":prob_to_american(avg_home_prob) if avg_home_prob else None,
-            "consensus_away_american_from_prob":prob_to_american(avg_away_prob) if avg_away_prob else None}
+        away_prices, home_prices, per_book = extract_h2h_prices(event)
+        # Get spreads per team (may be empty)
+        home_spreads, away_spreads = extract_spread_values(event)
+
+        # Skip events without moneyline info
+        if not away_prices or not home_prices:
+            continue
+
+        avg_home_moneyline = simple_average(home_prices)
+        avg_away_moneyline = simple_average(away_prices)
+        avg_home_prob = average_implied_prob(home_prices)
+        avg_away_prob = average_implied_prob(away_prices)
+        avg_home_spread = simple_average(home_spreads) if home_spreads else None
+        avg_away_spread = simple_average(away_spreads) if away_spreads else None
+
+        row = {
+            "timestamp": ts,
+            "snapshot_label": args.snapshot_label,
+            "event_id": event.get("id"),
+            "commence_time": format_commence_pacific(event.get("commence_time")),
+            "home_team": event.get("home_team"),
+            "away_team": event.get("away_team"),
+            "bookmaker_count": len(per_book),
+            "avg_home_moneyline": round(avg_home_moneyline, 2) if avg_home_moneyline is not None else None,
+            "avg_away_moneyline": round(avg_away_moneyline, 2) if avg_away_moneyline is not None else None,
+            "avg_home_implied_prob": round(avg_home_prob, 5) if avg_home_prob is not None else None,
+            "avg_away_implied_prob": round(avg_away_prob, 5) if avg_away_prob is not None else None,
+            "consensus_home_american_from_prob": prob_to_american(avg_home_prob) if avg_home_prob else None,
+            "consensus_away_american_from_prob": prob_to_american(avg_away_prob) if avg_away_prob else None
+        }
+        # attach spread fields
+        row["avg_home_spread"] = round(avg_home_spread, 2) if avg_home_spread is not None else None
+        row["avg_away_spread"] = round(avg_away_spread, 2) if avg_away_spread is not None else None
+
         # prepare ordered values, convert None to empty string
         values = [row.get(k) if row.get(k) is not None else "" for k in fieldnames]
         rows_to_append.append(values)
 
     # append all rows in batches to avoid per-row write quota limits
     if rows_to_append:
-        append_sheet_rows(service, args.sheet_id, args.sheet_name, rows_to_append, batch_size=50)
+        append_sheet_rows(service, args.sheet_id, args.sheet_name, [list(r) for r in rows_to_append], batch_size=50)
     print(f"Wrote {len(rows_to_append)} rows to Google Sheet {args.sheet_id}")
 
-if __name__=="__main__": main()
+
+if __name__ == "__main__":
+    main()
