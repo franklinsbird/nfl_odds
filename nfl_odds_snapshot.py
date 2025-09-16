@@ -51,6 +51,9 @@ def _api_key_from_bashrc(var_name: str = "THE_ODDS_API_KEY") -> Optional[str]:
 def _default_api_key() -> Optional[str]:
     return os.getenv("THE_ODDS_API_KEY") or _api_key_from_bashrc()
 
+def _default_gcp_creds() -> Optional[str]:
+    return os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or _api_key_from_bashrc("GOOGLE_API_KEY")
+
 def american_to_prob(odds: int) -> float:
     if odds is None: return float("nan")
     if odds >= 0: return 100.0/(odds+100.0)
@@ -184,10 +187,10 @@ def save_raw_snapshot(raw_dir:str,label:str,timestamp_iso:str,payload:List[Dict]
 
 def get_sheets_service(creds_path: Optional[str] = None):
     """Return a Sheets API service. If creds_path is None, fall back to the
-    GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_API_KEY environment variable or ~/.bashrc.
     """
     if not creds_path:
-        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        creds_path = _default_gcp_creds()
     if not creds_path:
         raise FileNotFoundError("No Google credentials path provided")
     creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scope)
@@ -316,7 +319,7 @@ def main():
     parser.add_argument("--snapshot-label", default="snapshot")
     parser.add_argument("--sheet-id", default=os.getenv("SHEET_ID", DEFAULT_SHEET_ID))
     parser.add_argument("--sheet-name", default=DEFAULT_SHEET_NAME)
-    parser.add_argument("--gcp-creds", default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+    parser.add_argument("--gcp-creds", default=_default_gcp_creds())
     parser.add_argument("--raw-file", default=None, help="Path to a previously saved raw snapshot JSON to use instead of calling the Odds API")
     parser.add_argument("--raw-dir", default=DEFAULT_RAW_DIR)
     args=parser.parse_args()
@@ -352,7 +355,7 @@ def main():
     try:
         service = get_sheets_service(args.gcp_creds)
     except Exception:
-        print("No Google credentials provided; set GOOGLE_APPLICATION_CREDENTIALS or pass --gcp-creds pointing to a service account JSON file")
+        print("No Google credentials provided; set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_API_KEY (env var or in ~/.bashrc), or pass --gcp-creds pointing to a service account JSON file")
         sys.exit(2)
 
     ensure_sheet_header(service, args.sheet_id, args.sheet_name, fieldnames)
